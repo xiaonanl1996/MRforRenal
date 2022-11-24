@@ -1,0 +1,667 @@
+---
+title: "MRforRenal Manuscript Tables"
+author: "Xiaonan Liu, Lei Clifton"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+always_allow_html: true
+output: 
+  word_document:
+      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(survival)
+library(survminer)
+library(rms)
+library(forestplot)
+library(grid)
+library(pander)
+
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+source(here::here(config$functions$descriptive))
+#-------------------------------------------------------------------------------------------------------------------
+# Setup
+
+figure <- 1
+table <- 1
+suppfig <- 1
+footnote_no <- 1
+
+```
+
+# Introduction
+
+This report documents the tables and figures for **main analyses** of MRforRenal.
+
+Objective: Use MR to explore if HTN is causal to renal cancer.
+
+# Methods
+
+Primary outcome is renal parenchyma cancer. Secondary outcomes are: 
+
+* Renal composite cancer(including renal parenchyma and renal pelvis cancer)
+* Renal pelvis cancer
+
+Primary exposures are SBP and DBP. 
+
+Primary instrument variables are SBP PRS and DBP PRS developed from [Evangelou2018](https://www.nature.com/articles/s41588-018-0205-x).
+
+```{r derive-data, include=FALSE, cache=TRUE}
+
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+exclusions <- function(data) {
+  
+  excl$initial <<- nrow(data)
+  
+  # Array as proxy for genetic data availability
+  data<-data%>%filter(!is.na(GeP_Array))
+  excl$genetic<<-nrow(data)
+
+  # SBP PRS
+  data<-data%>%filter(!(is.na(TEU_SBP_PRS)))
+  excl$corecomp<<-nrow(data)
+
+  # White British
+  data<-data%>%filter(!is.na(GeP_ethnic))
+  excl$white<<-nrow(data)
+
+  # Age
+  data<-data%>%filter(!(!is.na(TEU_BaC_AgeAtRec) & TEU_BaC_AgeAtRec<40 | TEU_BaC_AgeAtRec>=70))
+  excl$agewithin<<-nrow(data)
+  
+  # Exclude individuals with missing BP data
+  data <- data[!is.na(data$TEU_BlP_SBP.avg),]
+  data <- data[!is.na(data$TEU_BlP_DBP.avg),]
+  
+  # Exclude participants who only had BP measured once
+  # because BP values are super variable within person
+  data <- data[data$TEU_BlP_nSBP == 2 & data$TEU_BlP_nDBP == 2,]
+  
+  excl$BPmiss <<- nrow(data)
+  
+  # Exclude individuals with implausible BP data
+  data <- data[data$TEU_BlP_SBP.avg >= 70 & data$TEU_BlP_SBP.avg <= 270,]
+  data <- data[data$TEU_BlP_DBP.avg >= 50 & data$TEU_BlP_DBP.avg <= 150,]
+  
+  excl$BPimp <<- nrow(data)
+  
+  # Exclude individuals with missing BMI or smoking status
+  data <- data[!is.na(data$BSM_BMI),]
+  
+  excl$BMImiss <<- nrow(data)
+  
+  data <- data[data$TEU_Smo_Status!="Unanswered",]
+
+  excl$Smokmiss <<-nrow(data)
+  
+  # # Exclude those with prior cancer (except non-melanoma skin cancer and CIS)
+  data <- data[data$OtherCancerDx_Prevalent==0,]
+  
+  excl$othercancer <<- nrow(data)
+  
+  
+  return(data)
+}
+
+excl <- list(initial=0)
+
+data <-
+  #evalWithMemoization(
+    derive_variables(
+      database = config$data$database,
+      field_definitions = TEU_SPECS$MRforRenal,
+      exclusions = exclusions
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$MRforRenal, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$MRforRenal, return_type="list")
+
+
+```
+
+# Dataset (n=`r nrow(data)`)
+
+## Exclusion Criteria 
+
+See "K:/TEU/MRforRenal/Stats_Outputs/Descriptives/MRforRenal_excl.png"
+
+```{r FC,eval=FALSE}
+
+############################
+# Analysis FC
+label1 <- paste0('UKB participants\\nn = ', excl$initial)
+label2 <- paste0('Unrelated White British participants with','\\n', 'good quality genotyping data, aged between 40 and 70\\n','n = ', excl$agewithin)
+label3 <- paste0('Complete information on key variables\\nn = ', excl$Smokmiss)
+label4 <- paste0('Study population: No history of cancer diagnosis\\nn = ', excl$othercancer)
+
+
+label5 <- paste0(excl$ini-excl$genetic, ' missing genotyping data\\l', excl$genetic-excl$corecomp, ' excluded in genetic quality control\\l', excl$corecomp-excl$white,' not of genetically White British ancestry\\l',excl$white-excl$agewithin,' outside the age range of [40,70) years\\l')
+label6 <- paste0(excl$agewithin-excl$BPmiss,' missing BP data from baseline assessment\\l', excl$BPmiss-excl$BPimp, ' implausible BP data from baseline assessment\\l',excl$BPimp-excl$BMImiss,' missing BMI from baseline assessment\\l',excl$BMImiss-excl$Smokmiss,' missing smoking status from baseline assessment')
+label7 <- paste0(excl$Smokmiss-excl$othercancer,' prevalent cancer at baseline \\l (except non-melanoma skin cancer and CIS)\\l')
+
+
+gv <- read_file(file.path(config$outputs$flowcharts, "Flowchart.gv"))
+
+export_svg(DiagrammeR::grViz(glue(gv))
+) %>% charToRaw %>% rsvg %>%
+  png::writePNG(file.path(config$outputs$descriptives, "MRforRenal_excl.png"))
+
+DiagrammeR::grViz(glue(gv))
+
+```
+
+**Note on BP treatment users**: 
+
+<span style="color: red;">For self reported BP medication users at baseline, we increased their SBP by 15 mmHg and DBP by 10 mmHg. </span> Table 1 shows the descriptive stats of the elevated BP measures.
+
+
+```{r analysis-data}
+
+analysis_data <- data %>%
+  # Elevate SBP, DBP values for BP meds users 
+  # Note: TRUE doesn't work because TEU_selfrepHTN_meds has NA, which makes SBP NA as well!
+  mutate(TEU_BlP_SBP.avg=ifelse(TEU_selfrepHTN_meds==FALSE | is.na(TEU_selfrepHTN_meds),TEU_BlP_SBP.avg,TEU_BlP_SBP.avg+15),
+         TEU_BlP_DBP.avg=ifelse(TEU_selfrepHTN_meds==FALSE | is.na(TEU_selfrepHTN_meds),TEU_BlP_DBP.avg,TEU_BlP_DBP.avg+10)) %>%
+  # Switch missing categories to NA and drop levels
+  mutate_if(is.factor, list(~na_if(., "Unanswered")))%>%
+  mutate_if(is.factor, list(~na_if(., "Unknown")))%>%
+  mutate_if(is.factor, list(~na_if(., "Prefer not to answer")))%>%
+  droplevels() %>%
+  # Keep only analysis vars
+  select(ID, TEU_paren_status, TEU_paren_time, TEU_comp_status,TEU_comp_time, TEU_pelvis_status, TEU_pelvis_time , TEU_ureter_status,TEU_ureter_time,TEU_bladder_status,TEU_bladder_time,
+         TEU_BaC_AgeAtRec,TEU_BaC_AgeCat,BaC_Sex,
+         TEU_SBP_PRS,TEU_DBP_PRS,TEU_BP_PRS, #haven't seen ppl using categorical format
+         TEU_SBP_PRS_Sens8,TEU_DBP_PRS_Sens8,
+         TEU_SBP_PRS_Sens6,TEU_DBP_PRS_Sens6,
+         TEU_SBP_PRS_quintiles,TEU_DBP_PRS_quintiles,TEU_BP_PRS_quintiles,
+         TEU_BlP_SBP.avg, TEU_BlP_DBP.avg,
+         BSM_BMI,TEU_BSM_BMIcat,TEU_Smo_Status,TEU_Alc_WeeklyCat,
+         TEU_Pha_METsover1200,TEU_FaH_CVD, HTN_comorb_numcat, 
+         TEU_TownsendDepInd_Quint, TEU_HouseholdIncome,TEU_Emp_category,TEU_Edu_ISCED,
+         TEU_Rec_Country,GeP_Array, paste0('GeP_PC_',1:10))
+
+# Note: We don't use the BP quintiles from spec because those were computed from BP not adjusted for ppl on trt yet!
+backup<-analysis_data
+```
+
+# Baseline characteristics
+
+Table 1 shows the descriptive statistics of analysis population by gender. It includes most of the covariates from MACE HTN project. Both continuous and categorical format (if applicable) are presented.
+
+
+**Notes on SBP, DBP PRS**:
+
+* There are 885 SNPs associated with BP in total. SBP PRS consists of 884 variants and 885 variants for DBP PRS. They share the same SNPs, just with different weights (i.e. Betas). After QC, we removed 3 ambiguous SNPs from both PRS.
+
+
+* LD variants: Among 885 BP SNPs, we have 1 pair of SNP (11:54835623 and 11:55113534) has R2 above 0.3 (R2=0.36). I think in MR world, it requires SNPs to be independent of each other and here we have already chosen a quite high LD threshold. Also later on for the sensitivity analysis, we would compute the variant-outcome association for each variant, so I think we should exclude one variant (11:55113534).
+
+* **After QC and LD, for SBP PRS consists of 880 SNPs left and 881 SNPs for DBP PRS.** This version of PRS were used in MR primary analyses. For later sensitivity analyses, we would exclude top BMI, obesity, smoking associated BP variants to explore potential pleiotrophy effect.
+
+
+
+## By gender
+
+```{r descrp by gender,results='asis'}
+
+tmp<-analysis_data%>%
+  #mutate_at(c("TEU_paren_status","TEU_comp_status","TEU_pelvis_status","TEU_ureter_status","TEU_bladder_status"),~as.factor(.))%>%
+  select(TEU_BaC_AgeAtRec,TEU_BaC_AgeCat,BaC_Sex,TEU_SBP_PRS_quintiles,TEU_DBP_PRS_quintiles,
+         TEU_BlP_SBP.avg,TEU_BlP_DBP.avg,
+         BSM_BMI,TEU_BSM_BMIcat,TEU_Smo_Status,TEU_Alc_WeeklyCat,TEU_Pha_METsover1200,
+         HTN_comorb_numcat,TEU_TownsendDepInd_Quint,TEU_HouseholdIncome,TEU_Emp_category,
+         TEU_Edu_ISCED,TEU_Rec_Country)
+
+# By gender
+
+table<-tableby(BaC_Sex~.,data=tmp, control=my_controls)
+
+sumtab=summary(table,labelTranslations = pretty_names,title=paste0('Table 1a. Descriptive statistics of analysis population by gender (N= ',nrow(analysis_data),")"))
+
+
+sumtab
+
+
+```
+
+
+## By SBP PRS Quintiles
+
+```{r descrp,results='asis'}
+
+table<-tableby(TEU_SBP_PRS_quintiles~.,data=tmp, control=my_controls)
+
+sumtab=summary(table,labelTranslations = pretty_names,title=paste0('Table 1b. Descriptive statistics of analysis population by SBP PRS quintiles (N= ',nrow(analysis_data),")"))
+
+
+sumtab
+
+
+```
+
+## By DBP PRS Quintiles
+
+```{r,results='asis'}
+
+table<-tableby(TEU_DBP_PRS_quintiles~.,data=tmp, control=my_controls)
+
+sumtab=summary(table,labelTranslations = pretty_names,title=paste0('Table 1c. Descriptive statistics of analysis population by DBP PRS quintiles (N= ',nrow(analysis_data),")"))
+
+
+sumtab
+
+
+```
+
+# Epi Association Analyses
+
+## Renal Parenchyma Cancer 
+
+Two **complete-case** Cox regression model were performed in parallel to assess the effect of prevalent hypertension on incident renal cancer:
+
+* Model 1: Renal parenchyma cancer ~ SBP + covariates in Table 1 (see Analysis plan)
+* Model 2: Renal parenchyma cancer ~ DBP + covariates in Table 1 (see Analysis plan)
+
+Note: SBP were scaled by dividing 5 so that the corresponding HR represents HR per 5mmHg increase in SBP. Same applies for DBP.
+
+```{r primary assoc}
+
+pretty_names$`I(TEU_BlP_SBP.avg/5)`="Baseline SBP"
+pretty_names$`I(TEU_BlP_DBP.avg/5)`="Baseline DBP"
+
+# Employment category is causing issue for the model convergence so removed.
+
+RF<-c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','TEU_Alc_WeeklyCat','TEU_Pha_METsover1200','HTN_comorb_numcat','TEU_TownsendDepInd_Quint','TEU_HouseholdIncome','TEU_Edu_ISCED','TEU_Rec_Country')
+
+vars1<-c('I(TEU_BlP_SBP.avg/5)',RF);vars2<-c('I(TEU_BlP_DBP.avg/5)',RF)
+
+# Primary outcome: Renal Parenchyma
+
+formula <- as.formula(paste0("Surv(TEU_paren_time, TEU_paren_status)~ ", paste(vars1, collapse="+")))
+
+primary_assoc1 <- coxph(formula,data=analysis_data)
+
+primary_assoc_tab1<-printresults(df=analysis_data,varlist = vars1,modeloutput = primary_assoc1,pretty_names = pretty_names,IDcol = TRUE)
+
+##
+formula <- as.formula(paste0("Surv(TEU_paren_time, TEU_paren_status)~ ", paste(vars2, collapse="+")))
+
+primary_assoc2 <- coxph(formula,data=analysis_data)
+
+primary_assoc_tab2<-printresults(df=analysis_data,varlist = vars2,modeloutput = primary_assoc2,pretty_names = pretty_names,IDcol = TRUE)
+
+#models<-output1_2(RF=RF,return = "model")
+
+#kable(output1_2(RF=RF),caption = "Association of SBP, DBP with renal parenchyma cancer via logistic model")%>%
+ # kable_styling(bootstrap_options = c("striped", "hover")) %>%
+#  add_header_above(c(" " = 1, "With BMI" = 3, "Without BMI" = 3))
+
+paren_assoc<-full_join(primary_assoc_tab1,primary_assoc_tab2,by=c("IDcol"))%>%
+  mutate(Variable=coalesce(Coefficient.x,Coefficient.y))%>%
+  select(Variable,Levels.x,HR.x,`95% CI.x`,p.x,HR.y,`95% CI.y`,p.y)%>%
+      `colnames<-`(c("Variable","Levels", "HR", "95% CI" , "p","HR" ,"95% CI", "p"))
+
+pander(paren_assoc,caption=paste0("Table 2. Epidemiological association of BP with incident renal parenchyma cancer N= ",primary_assoc1$n))
+    
+```
+
+```{r renal paren forestplot}
+
+primary_assoc_plot1<-printresults(df=analysis_data,varlist = "I(TEU_BlP_SBP.avg/5)",modeloutput = primary_assoc1,pretty_names = pretty_names,IDcol = TRUE,forplot = TRUE)
+
+primary_assoc_plot2<-printresults(df=analysis_data,varlist = "I(TEU_BlP_DBP.avg/5)",modeloutput = primary_assoc2,pretty_names = pretty_names,IDcol = TRUE,forplot = TRUE)
+
+# Generate forestplot for epi association 
+
+tabletext <- cbind(c("Renal-parenchyma \n cancer","SBP","DBP"),
+                     c("HR",primary_assoc_tab1$HR[1],primary_assoc_tab2$HR[1]),
+                     c("95% CI",primary_assoc_tab1$`95% CI`[1],primary_assoc_tab2$`95% CI`[1]),
+                     c("p-value",primary_assoc_tab1$p[1],primary_assoc_tab2$p[1]))
+  
+forestplot(tabletext,
+                  graph.pos=4,
+                  #hrzl_lines = list("2"=gpar(col = "#444444")),
+                  #legend = c("PRS"),
+                  #legend_args = fpLegend(title="Quintiles of BP PRS",
+                  # gp = gpar(col = "#CCCCCC", fill = "#F9F9F9")),
+                  mean = t(cbind(NA,primary_assoc_plot1$HR_num, primary_assoc_plot2$HR_num)),
+                  lower = t(cbind(NA,primary_assoc_plot1$LCI, primary_assoc_plot2$LCI)),
+                  upper = t(cbind(NA,primary_assoc_plot1$UCI, primary_assoc_plot2$UCI)),
+                  #col = fpColors(box = c("green", "blue", "purple", "red", "orange")),
+                  boxsize=0.2,
+                  xlab = paste0("HR per 5mmHg increase in \n corresponding BP"),
+                  vertices=TRUE,
+                  xlog=TRUE,
+                  xticks=c(1,1.02,1.04,1.06,1.08,1.10),
+                  is.summary=t(cbind(TRUE,FALSE,FALSE)),
+                  col = fpColors(box = "royalblue",
+                                 line = "darkblue"
+                  ),
+                  title=paste0("Forest plot of BP with renal parenchyma cancer")
+  )
+
+```
+
+```{r Model Checking,eval=FALSE}
+
+
+## 1. PHA
+pha_plots<-ggcoxzph(cox.zph(primary_assoc1))
+  
+## 2. Multicollinearity
+formula<-as.formula('Surv(TEU_paren_time, TEU_paren_status) ~ TEU_BlP_SBP.avg + TEU_BaC_AgeCat + 
+    BaC_Sex + TEU_BSM_BMIcat + TEU_Smo_Status + TEU_Alc_WeeklyCat + 
+    TEU_Pha_METsover1200 + HTN_comorb_numcat + TEU_TownsendDepInd_Quint + 
+    TEU_HouseholdIncome + TEU_Edu_ISCED + TEU_Rec_Country')
+  
+vifs<-rms::vif(cph(formula,data=analysis_data))
+cat("Any VIF above>10:",any(vifs>10))
+
+## Same for Model 2
+
+## 1. PHA
+pha_plots<-ggcoxzph(cox.zph(primary_assoc2))
+  
+## 2. Multicollinearity
+formula<-as.formula('Surv(TEU_paren_time, TEU_paren_status) ~ TEU_BlP_DBP.avg + TEU_BaC_AgeCat + 
+    BaC_Sex + TEU_BSM_BMIcat + TEU_Smo_Status + TEU_Alc_WeeklyCat + 
+    TEU_Pha_METsover1200 + HTN_comorb_numcat + TEU_TownsendDepInd_Quint + 
+    TEU_HouseholdIncome + TEU_Edu_ISCED + TEU_Rec_Country')
+  
+vifs<-rms::vif(cph(formula,data=analysis_data))
+cat("Any VIF above>10:",any(vifs>10))
+
+
+```
+
+
+
+## Renal Composite Cancer
+
+Same two model structure as above but with different outcome, renal composite cancer.
+
+Note: SBP were scaled by dividing 5 so that the corresponding HR represents HR per 5mmHg increase in SBP. Same applies for DBP.
+
+```{r}
+
+# Secondary outcome: Renal composite
+
+formula <- as.formula(paste0("Surv(TEU_comp_time, TEU_comp_status)~ ", paste(vars1, collapse="+")))
+
+second_assoc1 <- coxph(formula,data=analysis_data)
+
+second_assoc_tab1<-printresults(df=analysis_data,varlist = vars1,modeloutput = second_assoc1,pretty_names = pretty_names,IDcol = TRUE)
+
+##
+formula <- as.formula(paste0("Surv(TEU_comp_time, TEU_comp_status)~ ", paste(vars2, collapse="+")))
+
+second_assoc2 <- coxph(formula,data=analysis_data)
+
+second_assoc_tab2<-printresults(df=analysis_data,varlist = vars2,modeloutput = second_assoc2,pretty_names = pretty_names,IDcol = TRUE)
+
+
+comp_assoc<-full_join(second_assoc_tab1,second_assoc_tab2,by=c("IDcol"))%>%
+  mutate(Variable=coalesce(Coefficient.x,Coefficient.y))%>%
+  select(Variable,Levels.x,HR.x,`95% CI.x`,p.x,HR.y,`95% CI.y`,p.y)%>%
+      `colnames<-`(c("Variable","Levels", "HR", "95% CI" , "p","HR" ,"95% CI", "p"))
+
+pander(comp_assoc,caption=paste0("Table 2b. Epidemiological association of BP with incident renal composite cancer N= ",second_assoc1$n))
+
+```
+
+```{r renal comp forestplot}
+
+# Generate forestplot for epi association 
+
+second_assoc_plot1<-printresults(df=analysis_data,varlist = "I(TEU_BlP_SBP.avg/5)",modeloutput = second_assoc1,pretty_names = pretty_names,IDcol = FALSE,forplot = TRUE)
+
+second_assoc_plot2<-printresults(df=analysis_data,varlist = "I(TEU_BlP_DBP.avg/5)",modeloutput = second_assoc2,pretty_names = pretty_names,IDcol = FALSE,forplot = TRUE)
+
+
+tabletext <- cbind(c("Renal-composite \n cancer","SBP","DBP"),
+                     c("HR",second_assoc_tab1$HR[1],second_assoc_tab2$HR[1]),
+                     c("95% CI",second_assoc_tab1$`95% CI`[1],second_assoc_tab2$`95% CI`[1]),
+                     c("p-value",second_assoc_tab1$p[1],second_assoc_tab2$p[1]))
+  
+forestplot(tabletext,
+                  graph.pos=4,
+                  #legend = c("PRS"),
+                  #legend_args = fpLegend(title="Quintiles of BP PRS",
+                  # gp = gpar(col = "#CCCCCC", fill = "#F9F9F9")),
+                  mean = t(cbind(NA,second_assoc_plot1$HR_num, second_assoc_plot2$HR_num)),
+                  lower = t(cbind(NA,second_assoc_plot1$LCI, second_assoc_plot2$LCI)),
+                  upper = t(cbind(NA,second_assoc_plot1$UCI, second_assoc_plot2$UCI)),
+                  #col = fpColors(box = c("green", "blue", "purple", "red", "orange")),
+                  boxsize=0.2,
+                  xlab = paste0("HR per 5mmHg increase in \n corresponding BP"),
+                  vertices=TRUE,
+                  xlog=TRUE,
+                  xticks=c(1,1.02,1.04,1.06,1.08,1.10),
+                  is.summary=c(TRUE,rep(FALSE,2)),
+                  col = fpColors(box = "royalblue",
+                                 line = "darkblue",
+                  ),
+                  title=paste0("Forest plot of BP with renal composite cancer")
+  )
+
+```
+
+
+# MR Assumptions
+
+* Relevance assumption: Checked via linear regression adjusting for age (continuous), sex, BMI (continuous), smoking status, genetic array and first 10 PCs. F-statistics>10 indicates low risk of weak instrument bias.
+
+```{r relevance}
+RF <- c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10))
+
+# Full version
+sbp_lm<-MR_outputs(return = "relevance",RF=RF)
+
+dbp_lm<-MR_outputs(PRS="TEU_DBP_PRS",exposure = "TEU_BlP_DBP.avg",return = "relevance",RF=RF)
+
+relevance <- as.data.frame(rbind(sbp_lm$coefficients[2,],dbp_lm$coefficients[2,]))%>%
+  rename(`Estimate (mmHg per SD increase in PRS)`=Estimate,
+         P=`Pr(>|t|)`)%>%
+  mutate(`F-statistic`=c(sbp_lm$fstatistic[1],dbp_lm$fstatistic[1]),
+         P=pretty_pval(P))
+
+rownames(relevance)<-c("SBP PRS","DBP PRS")
+
+pander(relevance,caption = "Relevance assumption check for full SBP and DBP PRS.")
+
+```
+
+Independence assumption and exclusion restriction will be checked through sensitivity analyses. 
+
+# MR primary analyses (One-sample using PRS)
+
+## Renal parenchyma cancer
+
+Primary outcome is renal parenchyma cancer. We computed Wald estimate of the causal effect, $\beta_{XY}$ where
+
+* Association of SBP-PRS with incident renal parenchyma (i.e. $\beta_{ZY}$) was assessed using Cox regression adjusting for age (continuous), sex, BMI (continuous), smoking status, genetic array and first 10 PCs.
+
+* Association of SBP-PRS with SBP (i.e. $\beta_{ZX}$) was assessed using linear regression adjusting for the same covariates.
+
+We repeated the above replacing SBP with DBP.
+
+**Note**: For presentation (to be incline with existing literature), "HR" column for SBP polygenic risk score presents the HR per 5 mmHg BP increase from PRS (i.e. $exp(\frac{\beta_{ZY}}{\beta_{ZX}}\times 5)$). "HR" column of all other covariates is presented as the standard (i.e. HR for increase in one SD unit of covariate). Same applies for DBP polygenic risk score.
+
+```{r primary MR}
+
+# Try 3 versions of SBP PRS first
+
+Paren_SBP_PRS1<-MR_outputs(RF=RF,return="MR",forestplot = TRUE)
+
+Paren_SBP_PRS2<-MR_outputs(PRS="TEU_SBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Paren_SBP_PRS3<-MR_outputs(PRS="TEU_SBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+pander(Paren_SBP_PRS1$tab, caption = paste0("Table 3a. Association of full SBP PRS with renal parenchyma cancer, N= ",nrow(analysis_data)))
+
+
+# Try 3 versions of DBP PRS first
+
+Paren_DBP_PRS1<-MR_outputs(PRS="TEU_DBP_PRS",RF=RF,return="MR",forestplot = TRUE)
+
+Paren_DBP_PRS2<-MR_outputs(PRS="TEU_DBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Paren_DBP_PRS3<-MR_outputs(PRS="TEU_DBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+#combine_forestplot(PRS1=DBP_PRS1, PRS2=DBP_PRS2, PRS3=DBP_PRS3,which_exposure = "DBP",which_PRS = "DBP PRS")
+
+pander(Paren_DBP_PRS1$tab,caption=paste0("Table 3b. Association of full DBP PRS with renal parenchyma cancer, N= ",nrow(analysis_data)))
+
+```
+
+```{r,eval=FALSE}
+
+# Forestplot for primary MR analysis
+
+# Only keep SBP and DBP (same format as epi forest plot)
+tabletext <- cbind(c("Renal-parenchyma \n cancer","SBP","DBP"),
+                     c("HR",Paren_SBP_PRS1$tab$HR[1],Paren_DBP_PRS1$tab$HR[1]),
+                     c("95% CI",Paren_SBP_PRS1$tab$`95% CI`[1],Paren_DBP_PRS1$tab$`95% CI`[1]),
+                     c("p-value",Paren_SBP_PRS1$tab$p[1],Paren_DBP_PRS1$tab$p[1]))
+  
+forestplot(tabletext,
+                  graph.pos=4,
+                  #legend = c("PRS"),
+                  #legend_args = fpLegend(title="Quintiles of BP PRS",
+                  # gp = gpar(col = "#CCCCCC", fill = "#F9F9F9")),
+                  mean = t(cbind(NA,Paren_SBP_PRS1$plot$hr, Paren_DBP_PRS1$plot$hr)),
+                  lower = t(cbind(NA,Paren_SBP_PRS1$plot$lci, Paren_DBP_PRS1$plot$lci)),
+                  upper = t(cbind(NA,Paren_SBP_PRS1$plot$uci, Paren_DBP_PRS1$plot$uci)),
+                  #col = fpColors(box = c("green", "blue", "purple", "red", "orange")),
+                  boxsize=0.2,
+                  xlab = paste0("HR per 5mmHg increase in \n BP from the corresponding BP PRS"),
+                  vertices=TRUE,
+                  xlog=TRUE,
+                  xticks=c(1,1.1,1.2,1.3),
+                  is.summary=c(TRUE,rep(FALSE,2)),
+                  col = fpColors(box = "tomato",
+                                 line = "darkred",
+                  ),
+                  title=paste0("Forest plot of BP with renal parenchyma cancer")
+  )
+```
+
+
+
+## Renal composite cancer
+
+Renal composite cancer includes renal parenchyma and renal pelvis cancer.
+
+**Note**: "HR" column for SBP polygenic risk score presents the HR per 5 mmHg BP increase from PRS (i.e. $exp(\frac{\beta_{ZY}}{\beta_{ZX}}\times 5)$). "HR" column of all other covariates is presented as the standard (i.e. HR for increase in one SD unit of covariate). Same applies for DBP polygenic risk score.
+
+```{r}
+
+# Try 3 versions of SBP PRS first
+
+Comp_SBP_PRS1<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_SBP_PRS2<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_SBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_SBP_PRS3<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_SBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+#combine_forestplot(PRS1=SBP_PRS1,PRS2=SBP_PRS2,PRS3=SBP_PRS3,which_outcome="Renal composite cancer")
+
+pander(Comp_SBP_PRS1$tab, caption = paste0("Table 4a. Association of full SBP PRS with renal composite cancer, N= ",nrow(analysis_data)))
+
+
+# Try 3 versions of DBP PRS first
+
+Comp_DBP_PRS1<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_DBP_PRS",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_DBP_PRS2<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_DBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_DBP_PRS3<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_DBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+#combine_forestplot(PRS1=DBP_PRS1, PRS2=DBP_PRS2, PRS3=DBP_PRS3,which_exposure = "DBP",which_PRS = "DBP PRS",which_outcome="Renal composite cancer")
+
+pander(Comp_DBP_PRS1$tab,caption=paste0("Table 4b. Association of full DBP PRS with renal composite cancer, N= ",nrow(analysis_data)))
+
+```
+
+```{r,eval=FALSE}
+
+# Forestplot for primary MR analysis
+
+# Only keep SBP and DBP (same format as epi forest plot)
+tabletext <- cbind(c("Renal-composite \n cancer","SBP","DBP"),
+                     c("HR",Comp_SBP_PRS1$tab$HR[1],Comp_DBP_PRS1$tab$HR[1]),
+                     c("95% CI",Comp_SBP_PRS1$tab$`95% CI`[1],Comp_DBP_PRS1$tab$`95% CI`[1]),
+                     c("p-value",Comp_SBP_PRS1$tab$p[1],Comp_DBP_PRS1$tab$p[1]))
+  
+forestplot(tabletext,
+                  graph.pos=4,
+                  #legend = c("PRS"),
+                  #legend_args = fpLegend(title="Quintiles of BP PRS",
+                  # gp = gpar(col = "#CCCCCC", fill = "#F9F9F9")),
+                  mean = t(cbind(NA,Comp_SBP_PRS1$plot$hr, Comp_DBP_PRS1$plot$hr)),
+                  lower = t(cbind(NA,Comp_SBP_PRS1$plot$lci, Comp_DBP_PRS1$plot$lci)),
+                  upper = t(cbind(NA,Comp_SBP_PRS1$plot$uci, Comp_DBP_PRS1$plot$uci)),
+                  #col = fpColors(box = c("green", "blue", "purple", "red", "orange")),
+                  boxsize=0.2,
+                  xlab = paste0("HR per 5mmHg increase in \n BP from the corresponding BP PRS"),
+                  vertices=TRUE,
+                  xlog=TRUE,
+                  xticks=c(1,1.1,1.2,1.3),
+                  is.summary=c(TRUE,rep(FALSE,2)),
+                  col = fpColors(box = "tomato",
+                                 line = "darkred",
+                  ),
+                  title=paste0("Forest plot of BP with renal composite cancer")
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

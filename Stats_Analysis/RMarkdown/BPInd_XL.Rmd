@@ -1,0 +1,302 @@
+---
+title: "Independent effect of SBP and DBP"
+author: "Xiaonan Liu, Jennifer Collister, Lei Clifton"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+always_allow_html: true
+output: 
+  word_document:
+      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(survival)
+library(survminer)
+library(rms)
+library(forestplot)
+library(grid)
+library(pander)
+library(MendelianRandomization)
+
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+source(here::here(config$functions$descriptive))
+#-------------------------------------------------------------------------------------------------------------------
+# Setup
+
+figure <- 1
+table <- 1
+suppfig <- 1
+footnote_no <- 1
+
+```
+
+```{r derive-data, include=FALSE}
+
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+data<-readRDS(here::here(file.path(config$data$derived,"data.RDS")))
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$MRforRenal, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$MRforRenal, return_type="list")
+
+
+```
+
+```{r analysis-data}
+
+analysis_data <- data %>%
+  # Elevate SBP, DBP values for BP meds users 
+  # Note: TRUE doesn't work because TEU_selfrepHTN_meds has NA, which makes SBP NA as well!
+  mutate(TEU_BlP_SBP.avg=ifelse(TEU_selfrepHTN_meds==FALSE | is.na(TEU_selfrepHTN_meds),TEU_BlP_SBP.avg,TEU_BlP_SBP.avg+15),
+         TEU_BlP_DBP.avg=ifelse(TEU_selfrepHTN_meds==FALSE | is.na(TEU_selfrepHTN_meds),TEU_BlP_DBP.avg,TEU_BlP_DBP.avg+10)) %>%
+  # Switch missing categories to NA and drop levels
+  mutate_if(is.factor, list(~na_if(., "Unanswered")))%>%
+  mutate_if(is.factor, list(~na_if(., "Unknown")))%>%
+  mutate_if(is.factor, list(~na_if(., "Prefer not to answer")))%>%
+  droplevels() %>%
+  # Keep only analysis vars
+  select(ID, TEU_paren_status, TEU_paren_time, TEU_comp_status,TEU_comp_time, TEU_pelvis_status, TEU_pelvis_time , TEU_ureter_status,TEU_ureter_time,TEU_bladder_status,TEU_bladder_time,
+         TEU_BaC_AgeAtRec,TEU_BaC_AgeCat,BaC_Sex,
+         TEU_SBP_PRS,TEU_DBP_PRS,TEU_BP_PRS, #haven't seen ppl using categorical format
+         TEU_SBP_PRS_Sens8,TEU_DBP_PRS_Sens8,
+         TEU_SBP_PRS_Sens6,TEU_DBP_PRS_Sens6,
+         TEU_SBP_PRS_quintiles,TEU_DBP_PRS_quintiles,TEU_BP_PRS_quintiles,
+         TEU_BlP_SBP.avg, TEU_BlP_DBP.avg,
+         BSM_BMI,TEU_BSM_BMIcat,TEU_Smo_Status,TEU_Alc_WeeklyCat,
+         TEU_Pha_METsover1200,TEU_FaH_CVD, HTN_comorb_numcat, 
+         TEU_TownsendDepInd_Quint, TEU_HouseholdIncome,TEU_Emp_category,TEU_Edu_ISCED,
+         TEU_Rec_Country,GeP_Array, paste0('GeP_PC_',1:10))
+
+# Note: We don't use the BP quintiles from spec because those were computed from BP not adjusted for ppl on trt yet!
+backup<-analysis_data
+```
+
+
+
+# Correlation of SBP and DBP PRS
+
+The correlation between SBP PRS and DBP PRS is `r pretty_dp(cor(analysis_data$TEU_SBP_PRS,analysis_data$TEU_DBP_PRS),2)`.
+
+```{r cor}
+
+cor(analysis_data$TEU_SBP_PRS,analysis_data$TEU_DBP_PRS)
+
+```
+
+To explore the independency between SBP and DBP, we performed the following models: 
+
+* SBP ~ SBP PRS + covariates to obtain $\beta_{ZX}_S$ and DBP ~ DBP PRS + covariates to obtain $\beta_{ZX}_D$.
+* Renal parenchyma cancer ~ SBP PRS + DBP PRS + covariates to obtain $\beta_{ZY}_S$ and $\beta_{ZY}_D$.
+
+where covariates include age, sex, BMI, smoking status, genetic array and 10 PCs.
+
+The causal estimate of SBP (presented as HR per 5mmHg increase from PRS) was computed as $exp(\frac{\beta_{ZY}_S}{\beta_{ZX}_S} \times 5)$. Same for DBP.
+
+```{r fit both}
+
+RF <- c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10))
+
+# First build linear regression (BP ~ BP PRS) to scale for interpretation
+lm_SBP <- lm(formula = as.formula(paste0("TEU_BlP_SBP.avg~TEU_SBP_PRS + ",paste(RF, collapse="+"))),analysis_data)
+
+lm_DBP <- lm(formula = as.formula(paste0("TEU_BlP_DBP.avg~TEU_DBP_PRS + ",paste(RF, collapse="+"))),analysis_data)
+
+# Scale PRS for easy interpretation 
+# (e.g. if scale_unit=5, then OR of BP PRS would mean OR per 5mmHg increase in BP from BP PRS)
+
+scaled_data=analysis_data;scale_unit=5
+    
+scaled_data[["TEU_SBP_PRS"]]=scaled_data[["TEU_SBP_PRS"]]*lm_SBP$coefficients["TEU_SBP_PRS"]/scale_unit
+    
+scaled_data[["TEU_DBP_PRS"]]=scaled_data[["TEU_DBP_PRS"]]*lm_DBP$coefficients["TEU_DBP_PRS"]/scale_unit
+    
+# Build Cox regression
+both_model <- coxph(formula = as.formula(paste0("Surv(TEU_paren_time,TEU_paren_status)~TEU_SBP_PRS+TEU_DBP_PRS+",paste(RF, collapse="+"))),scaled_data)
+    
+# In fact, the beta of PRS from model above actually corresponds to betaZY/betaXY (when scale_unit=1)
+    
+tab<-printresults(df=scaled_data,varlist = c("TEU_SBP_PRS","TEU_DBP_PRS"),modeloutput = both_model,pretty_names = pretty_names)
+
+pander(tab,caption = "Genetic association of BP with renal parenchyma cancer. HR represents per 5mmHg BP increase from PRS.")
+```
+
+And the VIFs of covariates are:
+
+```{r VIF}
+
+## 2. Multicollinearity
+formula<-as.formula('Surv(TEU_paren_time, TEU_paren_status) ~ TEU_SBP_PRS + TEU_DBP_PRS + 
+    TEU_BaC_AgeAtRec + BaC_Sex + BSM_BMI + TEU_Smo_Status + GeP_Array + 
+    GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + GeP_PC_6 + 
+    GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10')
+  
+vifs<-rms::vif(cph(formula,data=scaled_data))
+vifs
+```
+
+VIFs of both PRS are below 5, indicating no violations of multicollinearity. The causal effect vary distinctively compared to the results when we fitted them separately, indicating potential dependency? 
+
+# Further exploration 
+
+The full SBP and DBP PRS have almost the same SNPs (except one SNP), just with different weights (i.e. betas).
+
+[JC]: It looks like they found a bunch of SNPs associated with any BP trait, then made PRS by using the weights of those SNPs for each trait in turn, regardless of per-trait association. [XL]: This explains why some SNPs have insignificant p-value. 
+
+Incorporating approach from [(MV et al, 2015)](https://pubmed.ncbi.nlm.nih.gov/24474739/):
+
+For SBP analysis, we took a two-step approach: 
+
+(1) select SNPs that reached genome-wide association p-value threshold (i.e. p<5e-8) then 
+
+(2) within those SNPs, we further removed any SNPs that are associated with DBP (p<=0.01).Same for DBP analysis.
+
+The aim is to obtain two non-overlapping SNPs associated with SBP and DBP respectively and then perform MR analyses using these two sets of non-overlapping SNPs.
+
+```{r}
+
+# Read in beta_ZY copied from BMRC 
+
+beta_ZY<-read.delim(file.path(config$data$derived,"beta_ZY.TEU_paren_status.glm.logistic"),header = TRUE)
+
+# Only keep the essential columns 
+beta_ZY<-beta_ZY%>%select(ID,A1,BETA,SE,P)
+
+
+beta_ZX<-read.csv('K:\\TEU\\UKB_Genetic_Data\\PRS_Pipeline\\prs\\projects\\htn-evangelou2018\\inputs\\Betas.csv')
+
+beta_ZX<-beta_ZX%>%select(effect_allele,reference_allele,Beta_SBP,se_SBP,P_SBP,Beta_DBP,se_DBP,P_DBP,chr_pos)
+
+# Left join on beta_ZY because it only contains SNPs after QC and LD
+betas<-left_join(beta_ZY,beta_ZX,by=c("ID"="chr_pos"))
+
+# First need to check if it's only just flipping beta scenario, no strand flipping scenario.
+
+#betas%>%mutate(ind=case_when(A1==effect_allele ~ 1,
+#                             A1==reference_allele ~ 1,
+#                             TRUE ~ 0))%>%pull(ind)%>%unique
+
+# Fine just flipping beta scenario
+
+# We would flip beta_ZY if necessary because it's easier to flip 1 beta than 2
+# So the effect allele is "effect_allele" column
+betas<-betas%>%
+  mutate(Beta_Renal=ifelse(A1==effect_allele,BETA,-BETA))%>%
+  select(!c("BETA","A1"))
+
+
+
+```
+
+
+Among `r sum(!is.na(betas$P_SBP))` SNPs in SBP PRS (after QC): 
+
+* `r betas%>%filter(!is.na(P_SBP)&P_SBP<5e-8)%>%nrow()` reached genome-wide association p-value threshold (i.e. p<5e-8)
+
+* `r betas%>%filter(!is.na(P_SBP)&P_SBP<5e-8&P_DBP>0.01)%>%nrow()` not associated with DBP 
+
+Among `r sum(!is.na(betas$P_DBP))` SNPs in DBP PRS (after QC): 
+
+* `r betas%>%filter(!is.na(P_DBP)&P_DBP<5e-8)%>%nrow()` reached genome-wide association p-value threshold (i.e. p<5e-8)
+
+* `r betas%>%filter(!is.na(P_DBP)&P_DBP<5e-8&P_SBP>0.01)%>%nrow()` not associated with SBP 
+
+```{r Two step filtering,eval=FALSE}
+
+# SBP SNPs
+
+# How many reached p<5e-8
+betas%>%filter(!is.na(P_SBP)&P_SBP<5e-8)%>%nrow()
+
+# How many not associated with DBP
+betas%>%filter(!is.na(P_SBP)&P_DBP>0.01)%>%
+  nrow()
+
+
+# DBP SNPs
+
+# How many reached p<5e-8
+betas%>%filter(!is.na(P_DBP)&P_DBP<5e-8)%>%nrow()
+
+# How many not associated with DBP
+betas%>%filter(!is.na(P_DBP)&P_SBP>0.01)%>%
+  nrow()
+
+```
+
+We performed two-sample MR analyses using 47 SBP SNPs and 32 DBP SNPs.
+
+```{r prep}
+
+# SBP
+# (Only SBP SNPs that are not assoc with DBP)
+betas_SBP<-betas%>%filter(!is.na(P_SBP)&P_SBP<5e-8&P_DBP>0.01) 
+
+MRInputObject_SBP <- mr_input(bx = betas_SBP$Beta_SBP,bxse = betas_SBP$se_SBP,by = betas_SBP$Beta_Renal,byse = betas_SBP$SE)
+
+# DBP
+# (Only SBP SNPs that are not assoc with DBP)
+betas_DBP<-betas%>%filter(!is.na(P_DBP)&P_DBP<5e-8&P_SBP>0.01) 
+
+MRInputObject_DBP <- mr_input(bx = betas_DBP$Beta_DBP,bxse = betas_DBP$se_DBP,by = betas_DBP$Beta_Renal,byse = betas_DBP$SE)
+
+```
+
+```{r TSMR}
+
+MRAllObject_SBP <- mr_allmethods(MRInputObject_SBP, method = "main")
+
+MRAllObject_DBP <- mr_allmethods(MRInputObject_DBP, method = "main")
+
+```
+
+```{r}
+
+# SBP
+SA_forestplot(MR_outputs_df=MRAllObject_SBP@Values, which_exposure="SBP",which_PRS="SBP PRS",which_outcome="Renal parenchyma cancer", xticks=c(0.25,1,1.5,2,2.5))
+
+SA_forestplot(MR_outputs_df=MRAllObject_DBP@Values, which_exposure="DBP",which_PRS="DBP PRS",which_outcome="Renal parenchyma cancer", xticks=c(0.05,1,1.5,2,2.5))
+```
+
+
+The estimates seem really inconsistent (which is alarming) and neither of SBP or DBP showed causal relationship with renal parenchyma cancer. Might be due to we removed too many SNPs that relevance assumption was violated? Could try changing the p-value threshold above so we don't remove too much? But ideally the threshold should really be pre-specified.
+
+
+
+
+
+
+
+
+
+
+

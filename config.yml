@@ -1,0 +1,27 @@
+data:
+ database: "K:/TEU/UKB33952_Data/Data_Downloads/V5_database_duckdb0.3.0/ukb_v5.db"
+ portal:
+  HES: "K:/TEU/UKB33952_Data/Data_Portal/HES_diagnoses/20220121"
+  deaths: "K:/TEU/UKB33952_Data/Data_Portal/Death_Registry/20220121"
+ derived: "Data/Derived"
+ analysed: "Data/Analysed"
+prs: "K:/TEU/UKB_Genetic_Data/PRS_Pipeline/prs/projects/htn-evangelou2018/outputs"
+cleaning:
+ withdrawals: "K:/TEU/UKB33952_Data/Data_Downloads/Withdrawals/w33952_20220222.csv"
+ renaming: "K:/TEU/UKB33952_Data/Data_Dictionary/Renaming_List_UPDATE_Sep2021_TEU.csv"
+ coding: "K:/TEU/UKB33952_Data/Data_Dictionary/Mappings/Encoding_files"
+ mapping: "K:/TEU/UKB33952_Data/Data_Dictionary/Mappings/Analysis_codings_xlsx/Renal"
+outputs:
+ figures: "Scripts/Stats_Analysis/RMarkdown/Figures"
+ flowcharts: "Scripts/Stats_Analysis/Flowcharts"
+ descriptives: "K:/TEU/MRforRenal/Stats_Outputs/Descriptives/"
+explore: "K:/TEU/MRforRenal/Explore/"
+functions:
+ JC: "Scripts/Stats_Analysis/JCfunctions.R"
+ general: "K:/TEU/TEU_Members/Xiaonan_Liu/Projects/PRSonCholstrl/Scripts/Stats_Analysis/General_Func/JCfunctions_XL.R"
+ flowchart: "K:/TEU/TEU_Members/Xiaonan_Liu/Projects/PRSonCholstrl/Scripts/Stats_Analysis/General_Func/FlowChart_pop.R"
+ descriptive: "Scripts/Stats_Analysis/DescrpStats.R"
+scripts:
+ cleaning: "Scripts/Data_Management/Scripts_Cleaning"
+ processing: "Scripts/Data_Management/Scripts_Processing"
+

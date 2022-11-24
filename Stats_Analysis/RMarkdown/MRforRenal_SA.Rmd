@@ -1,0 +1,1035 @@
+---
+title: "MRforRenal Sensitivity Analyses"
+author: "Xiaonan Liu"
+date: '2022-04-04'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(survival)
+library(survminer)
+library(rms)
+library(forestplot)
+library(grid)
+library(pander)
+library(MendelianRandomization)
+library(TwoSampleMR)
+
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+source(here::here(config$functions$descriptive))
+
+
+```
+
+# Introduction
+
+This report documents the process of conducting MR sensitivity analyses. Note that this Rmd is not for knitting (i.e. creating a html report) but for organising the code used for analyses.
+
+
+```{r derive-data, include=FALSE, cache=TRUE}
+
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+exclusions <- function(data) {
+  
+  excl$initial <<- nrow(data)
+  
+  # Array as proxy for genetic data availability
+  data<-data%>%filter(!is.na(GeP_Array))
+  excl$genetic<<-nrow(data)
+
+  # SBP PRS
+  data<-data%>%filter(!(is.na(TEU_SBP_PRS)))
+  excl$corecomp<<-nrow(data)
+
+  # White British
+  data<-data%>%filter(!is.na(GeP_ethnic))
+  excl$white<<-nrow(data)
+
+  # Age
+  data<-data%>%filter(!(!is.na(TEU_BaC_AgeAtRec) & TEU_BaC_AgeAtRec<40 | TEU_BaC_AgeAtRec>=70))
+  excl$agewithin<<-nrow(data)
+  
+  # Exclude individuals with missing BP data
+  data <- data[!is.na(data$TEU_BlP_SBP.avg),]
+  data <- data[!is.na(data$TEU_BlP_DBP.avg),]
+  
+  # Exclude participants who only had BP measured once
+  # because BP values are super variable within person
+  data <- data[data$TEU_BlP_nSBP == 2 & data$TEU_BlP_nDBP == 2,]
+  
+  excl$BPmiss <<- nrow(data)
+  
+  # Exclude individuals with implausible BP data
+  data <- data[data$TEU_BlP_SBP.avg >= 70 & data$TEU_BlP_SBP.avg <= 270,]
+  data <- data[data$TEU_BlP_DBP.avg >= 50 & data$TEU_BlP_DBP.avg <= 150,]
+  
+  excl$BPimp <<- nrow(data)
+  
+  # Exclude individuals with missing BMI or smoking status
+  data <- data[!is.na(data$BSM_BMI),]
+  
+  excl$BMImiss <<- nrow(data)
+  
+  data <- data[data$TEU_Smo_Status!="Unanswered",]
+
+  excl$Smokmiss <<-nrow(data)
+  
+  # # Exclude those with prior cancer (except non-melanoma skin cancer and CIS)
+  data <- data[data$OtherCancerDx_Prevalent==0,]
+  
+  excl$othercancer <<- nrow(data)
+  
+  
+  return(data)
+}
+
+excl <- list(initial=0)
+
+data <-
+  #evalWithMemoization(
+    derive_variables(
+      database = config$data$database,
+      field_definitions = TEU_SPECS$MRforRenal,
+      exclusions = exclusions
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$MRforRenal, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$MRforRenal, return_type="list")
+
+
+```
+
+**Note on BP treatment users**: 
+
+<span style="color: red;">For self reported BP medication users at baseline, we increased their SBP by 15 mmHg and DBP by 10 mmHg. </span> Table 1 shows the descriptive stats of the elevated BP measures.
+
+
+```{r analysis-data}
+
+analysis_data <- data %>%
+  # Elevate SBP, DBP values for BP meds users 
+  # Note: TRUE doesn't work because TEU_selfrepHTN_meds has NA, which makes SBP NA as well!
+  mutate(TEU_BlP_SBP.avg=ifelse(TEU_selfrepHTN_meds==FALSE | is.na(TEU_selfrepHTN_meds),TEU_BlP_SBP.avg,TEU_BlP_SBP.avg+15),
+         TEU_BlP_DBP.avg=ifelse(TEU_selfrepHTN_meds==FALSE | is.na(TEU_selfrepHTN_meds),TEU_BlP_DBP.avg,TEU_BlP_DBP.avg+10)) %>%
+  # Switch missing categories to NA and drop levels
+  mutate_if(is.factor, list(~na_if(., "Unanswered")))%>%
+  mutate_if(is.factor, list(~na_if(., "Unknown")))%>%
+  mutate_if(is.factor, list(~na_if(., "Prefer not to answer")))%>%
+  droplevels() %>%
+  # Keep only analysis vars
+  select(ID, TEU_paren_status, TEU_paren_time, TEU_comp_status,TEU_comp_time, TEU_pelvis_status, TEU_pelvis_time , TEU_ureter_status,TEU_ureter_time,TEU_bladder_status,TEU_bladder_time,
+         TEU_BaC_AgeAtRec,TEU_BaC_AgeCat,BaC_Sex,
+         TEU_SBP_PRS,TEU_DBP_PRS,TEU_BP_PRS, #haven't seen ppl using categorical format
+         TEU_SBP_PRS_Sens8,TEU_DBP_PRS_Sens8,
+         TEU_SBP_PRS_Sens6,TEU_DBP_PRS_Sens6,
+         TEU_SBP_PRS_quintiles,TEU_DBP_PRS_quintiles,TEU_BP_PRS_quintiles,
+         TEU_BlP_SBP.avg, TEU_BlP_DBP.avg,
+         BSM_BMI,TEU_BSM_BMIcat,TEU_Smo_Status,TEU_Alc_WeeklyCat,
+         TEU_Pha_METsover1200,TEU_FaH_CVD, HTN_comorb_numcat, 
+         TEU_TownsendDepInd_Quint, TEU_HouseholdIncome,TEU_Emp_category,TEU_Edu_ISCED,
+         TEU_Rec_Country,GeP_Array, paste0('GeP_PC_',1:10))
+
+# Note: We don't use the BP quintiles from spec because those were computed from BP not adjusted for ppl on trt yet!
+backup<-analysis_data
+```
+
+# Stratified by sex
+
+We repeated the main MR analyses within males and females separately (i.e. stratified by sex).
+
+## Renal-parenchyma cancer
+
+```{r SC by sex}
+
+Females<-analysis_data%>%filter(BaC_Sex=="Female")
+Males<-analysis_data%>%filter(BaC_Sex=="Male")  
+  
+
+## SBP
+
+## Females
+sbp_renal_F <- MR_outputs(data=Females,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),return="MR")
+
+pander(sbp_renal_F, caption = paste0("Geneic association of SBP with renal parenchyma cancer among females, N= ",nrow(Females)))
+
+## Males
+sbp_renal_M <- MR_outputs(data=Males,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),return="MR")
+
+pander(sbp_renal_M, caption = paste0("Geneic association of SBP with renal parenchyma cancer among males, N= ",nrow(Males)))
+
+# Obtain the p-value through interaction term
+outcome="Surv(TEU_paren_time,TEU_paren_status)"
+PRS="TEU_SBP_PRS"; RF=c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10),"TEU_SBP_PRS:BaC_Sex")
+sbp_renal<- coxph(formula = as.formula(paste0(outcome,"~",PRS,"+",paste(RF, collapse="+"))),data=analysis_data)
+    
+
+
+## DBP
+
+## Females
+dbp_renal_F <- MR_outputs(data=Females,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),PRS = "TEU_DBP_PRS",exposure = "TEU_BlP_DBP.avg",return="MR")
+
+pander(dbp_renal_F,caption=paste0("Genetic association of DBP with renal parenchyma cancer among feamles, N= ",nrow(Females)))
+
+## Males
+dbp_renal_M <- MR_outputs(data=Males,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),PRS = "TEU_DBP_PRS",exposure = "TEU_BlP_DBP.avg",return="MR")
+
+pander(dbp_renal_M,caption=paste0("Genetic association of DBP with renal parenchyma cancer among males, N= ",nrow(Males)))
+
+# Obtain the p-value through interaction term
+outcome="Surv(TEU_paren_time,TEU_paren_status)"
+PRS="TEU_DBP_PRS"; RF=c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10),"TEU_DBP_PRS:BaC_Sex")
+dbp_renal<- coxph(formula = as.formula(paste0(outcome,"~",PRS,"+",paste(RF, collapse="+"))),data=analysis_data)
+
+```
+
+## Renal-composite cancer
+
+```{r}
+
+## SBP
+
+## Females
+sbp_renal_F <- MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",data=Females,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),return="MR")
+
+pander(sbp_renal_F, caption = paste0("Geneic association of SBP with renal composite cancer among females, N= ",nrow(Females)))
+
+## Males
+sbp_renal_M <- MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",data=Males,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),return="MR")
+
+pander(sbp_renal_M, caption = paste0("Geneic association of SBP with renal composite cancer among males, N= ",nrow(Males)))
+
+# Obtain the p-value through interaction term
+outcome="Surv(TEU_comp_time,TEU_comp_status)"
+PRS="TEU_SBP_PRS"; RF=c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10),"TEU_SBP_PRS:BaC_Sex")
+sbp_renal<- coxph(formula = as.formula(paste0(outcome,"~",PRS,"+",paste(RF, collapse="+"))),data=analysis_data)
+
+
+## DBP
+
+## Females
+dbp_renal_F <- MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",data=Females,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),PRS = "TEU_DBP_PRS",exposure = "TEU_BlP_DBP.avg",return="MR")
+
+pander(dbp_renal_F,caption=paste0("Genetic association of DBP with renal composite cancer among feamles, N= ",nrow(Females)))
+
+## Males
+dbp_renal_M <- MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",data=Males,RF=c('TEU_BaC_AgeAtRec','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10)),PRS = "TEU_DBP_PRS",exposure = "TEU_BlP_DBP.avg",return="MR")
+
+pander(dbp_renal_M,caption=paste0("Genetic association of DBP with renal composite cancer among males, N= ",nrow(Males)))
+
+# Obtain the p-value through interaction term
+outcome="Surv(TEU_comp_time,TEU_comp_status)"
+PRS="TEU_DBP_PRS"; RF=c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10),"TEU_DBP_PRS:BaC_Sex")
+dbp_renal<- coxph(formula = as.formula(paste0(outcome,"~",PRS,"+",paste(RF, collapse="+"))),data=analysis_data)
+```
+
+
+
+# Negative control outcomes
+
+Using negative control outcomes or samples can act as a sensitivity analyses for examining potential pleiotropic effects (Burgess et al., 2019). Here we have chosen bladder cancer as negative control outcomes, neither should be related to BP.
+
+**Note**: "HR" column for SBP polygenic risk score presents the HR per 5 mmHg BP increase from PRS (i.e. $exp(\frac{\beta_{ZY}}{\beta_{ZX}}\times 5)$). "HR" column of all other covariates is presented as the standard (i.e. HR for increase in one SD unit of covariate). Same applies for DBP polygenic risk score.
+
+```{r bladder}
+RF <- c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10))
+
+## SBP
+sbp_renal <- MR_outputs(outcome="Surv(TEU_bladder_time,TEU_bladder_status)",RF=RF,return="MR")
+
+pander(sbp_renal, caption = paste0("Table 5a. Association of SBP PRS with bladder cancer, N= ",nrow(analysis_data)))
+
+
+## DBP
+dbp_renal <- MR_outputs(outcome="Surv(TEU_bladder_time,TEU_bladder_status)",RF=RF,PRS = "TEU_DBP_PRS",exposure = "TEU_BlP_DBP.avg",return="MR")
+
+pander(dbp_renal,caption=paste0("Table 5b. Association of DBP PRS with bladder cancer, N= ",nrow(analysis_data)))
+
+```
+
+
+# Pleiotropic variants
+
+We used [PhenoScanner](http://www.phenoscanner.medschl.cam.ac.uk/) to identify which variants in Evangelou2018 BP PRS were associated with **BMI, obesity and smoking status**. Those variants would be referred to as pleiotropic variants in MR setting.
+
+The associated traits for each variant in Evangelou2018 BP PRS were extracted with 2 chosen p-value thresholds: 5e-8 (i.e. variants trait association p-value<5e-8) and 5e-6. We then only selected the results from European ancestry and traits being BMI ([trait ID](https://www.ebi.ac.uk/efo/): EFO_0004340), obesity (EFO_0001073) or smoking status ([EFO_0006527](https://www.ebi.ac.uk/ols/ontologies/efo/terms?iri=http%3A%2F%2Fwww.ebi.ac.uk%2Fefo%2FEFO_0006527)) only.
+
+
+**Variants in LD**: Variants that are in LD (r2>0.8 in Europeans) were being considered as well. Take BMI as an example, if variant A in BP PRS was not associated with BMI but we found variant B (in LD with variant A) was actually associated with BMI from PhenoScanner, then we would count variant A associated with BMI as well.
+
+
+Below are the some descriptive stats on 3 versions of BP PRS: 
+
+* Full PRS: This would be the original BP PRS (i.e. **without** removing any pleitropic variants). After genetic QC, SBP PRS consists of 880 SNPs and 881 SNPs for DBP PRS (correlation=`r pretty_dp(cor(data$TEU_SBP_PRS,data$TEU_DBP_PRS),2)`. 
+
+* PRS with p threshold 5e-8: PRS with variants associated with BMI, obesity or smoking status removed. (variant trait p < 5e-8 counts as associated)
+
+43 SNPs (3 obesity assoc, 37 BMI assoc, 3 smoking assoc) removed from BP PRS.  
+
+
+* PRS with p threshold 5e-6: PRS with variants associated with BMI, obesity or smoking status removed. (variant trait p < 5e-6 counts as associated)
+
+71 SNPs (6 obesity assoc, 58 BMI assoc, 7 smoking assoc) removed from PRS. 
+
+```{r hist}
+# Transform data for plotting
+SBP_PRS<-analysis_data%>%
+  select(TEU_SBP_PRS,TEU_SBP_PRS_Sens8,TEU_SBP_PRS_Sens6)%>% 
+  gather(Version, value)
+
+DBP_PRS<-analysis_data%>%
+  select(TEU_DBP_PRS,TEU_DBP_PRS_Sens8,TEU_DBP_PRS_Sens6)%>% 
+  gather(Version, value)
+
+ggplot(SBP_PRS, aes(x=value, fill=Version)) +
+  geom_histogram(alpha=0.5, position="identity",bins = 20)+
+  #scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"))+
+  labs(x="PRS value",title = "Histogram of SBP PRS")+
+  scale_fill_discrete(name="Versions of PRS",
+                       labels=c("Full SBP PRS","SBP PRS (p threshold: 5e-8)","SBP PRS (p threshold: 5e-6)"))
+
+ggplot(DBP_PRS, aes(x=value, fill=Version)) +
+  geom_histogram(alpha=0.5, position="identity",bins=20)+
+  labs(x="PRS value",title="Histogram of DBP PRS")+
+  scale_fill_discrete(name="Versions of PRS",
+                       labels=c("Full DBP PRS","DBP PRS (p threshold: 5e-8)","DBP PRS (p threshold: 5e-6)"))
+
+```
+
+
+First we check if those latter 2 versions of PRS still satisfiy relevance assumption after removing pleiotropic variants using linear regression adjusted for the same covariates used above.
+
+```{r}
+
+## 5e-8
+sbp_lm<-MR_outputs(PRS="TEU_SBP_PRS_Sens8",exposure = "TEU_BlP_DBP.avg",return = "relevance",RF=RF)
+
+dbp_lm<-MR_outputs(PRS="TEU_DBP_PRS_Sens8",exposure = "TEU_BlP_DBP.avg",return = "relevance",RF=RF)
+
+relevance <- as.data.frame(rbind(sbp_lm$coefficients[2,],dbp_lm$coefficients[2,]))%>%
+  rename(`Estimate (mmHg per 1mmHg increase in PRS)`=Estimate,
+         P=`Pr(>|t|)`)%>%
+  mutate(`F-statistic`=c(sbp_lm$fstatistic[1],dbp_lm$fstatistic[1]),
+         P=pretty_pval(P))
+
+rownames(relevance)<-c("SBP PRS","DBP PRS")
+
+pander(relevance,caption = "Relevance assumption check for full SBP and DBP PRS with pvalue threshold 5e-8.")
+
+
+## 5e-6
+sbp_lm<-MR_outputs(PRS="TEU_SBP_PRS_Sens6",exposure = "TEU_BlP_DBP.avg",return = "relevance",RF=RF)
+
+dbp_lm<-MR_outputs(PRS="TEU_DBP_PRS_Sens6",exposure = "TEU_BlP_DBP.avg",return = "relevance",RF=RF)
+
+relevance <- as.data.frame(rbind(sbp_lm$coefficients[2,],dbp_lm$coefficients[2,]))%>%
+  rename(`Estimate (mmHg per 1mmHg increase in PRS)`=Estimate,
+         P=`Pr(>|t|)`)%>%
+  mutate(`F-statistic`=c(sbp_lm$fstatistic[1],dbp_lm$fstatistic[1]),
+         P=pretty_pval(P))
+
+rownames(relevance)<-c("SBP PRS","DBP PRS")
+
+pander(relevance,caption = "Relevance assumption check for SBP and DBP PRS with pvalue threshold 5e-6.")
+
+
+```
+
+```{r primary MR}
+
+# Try 3 versions of SBP PRS first
+
+Paren_SBP_PRS1<-MR_outputs(RF=RF,return="MR",forestplot = TRUE)
+
+Paren_SBP_PRS2<-MR_outputs(PRS="TEU_SBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Paren_SBP_PRS3<-MR_outputs(PRS="TEU_SBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+pander(Paren_SBP_PRS1$tab, caption = paste0("Table 3a. Association of full SBP PRS with renal parenchyma cancer, N= ",nrow(analysis_data)))
+
+
+# Try 3 versions of DBP PRS first
+
+Paren_DBP_PRS1<-MR_outputs(PRS="TEU_DBP_PRS",RF=RF,return="MR",forestplot = TRUE)
+
+Paren_DBP_PRS2<-MR_outputs(PRS="TEU_DBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Paren_DBP_PRS3<-MR_outputs(PRS="TEU_DBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+#combine_forestplot(PRS1=DBP_PRS1, PRS2=DBP_PRS2, PRS3=DBP_PRS3,which_exposure = "DBP",which_PRS = "DBP PRS")
+
+pander(Paren_DBP_PRS1$tab,caption=paste0("Table 3b. Association of full DBP PRS with renal parenchyma cancer, N= ",nrow(analysis_data)))
+
+```
+
+```{r forest plot,eval=FALSE}
+
+combine_forestplot(PRS1=Paren_SBP_PRS1,PRS2=Paren_SBP_PRS2,PRS3=Paren_SBP_PRS3)
+
+
+combine_forestplot(PRS1=Paren_DBP_PRS1, PRS2=Paren_DBP_PRS2, PRS3=Paren_DBP_PRS3,which_exposure = "DBP",which_PRS = "DBP PRS")
+
+
+```
+
+
+```{r}
+
+# Try 3 versions of SBP PRS first
+
+Comp_SBP_PRS1<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_SBP_PRS2<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_SBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_SBP_PRS3<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_SBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+#combine_forestplot(PRS1=SBP_PRS1,PRS2=SBP_PRS2,PRS3=SBP_PRS3,which_outcome="Renal composite cancer")
+
+pander(Comp_SBP_PRS1$tab, caption = paste0("Table 4a. Association of full SBP PRS with renal composite cancer, N= ",nrow(analysis_data)))
+
+
+# Try 3 versions of DBP PRS first
+
+Comp_DBP_PRS1<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_DBP_PRS",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_DBP_PRS2<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_DBP_PRS_Sens8",RF=RF,return="MR",forestplot = TRUE)
+
+Comp_DBP_PRS3<-MR_outputs(outcome="Surv(TEU_comp_time,TEU_comp_status)",PRS="TEU_DBP_PRS_Sens6",RF=RF,return="MR",forestplot = TRUE)
+
+#combine_forestplot(PRS1=DBP_PRS1, PRS2=DBP_PRS2, PRS3=DBP_PRS3,which_exposure = "DBP",which_PRS = "DBP PRS",which_outcome="Renal composite cancer")
+
+pander(Comp_DBP_PRS1$tab,caption=paste0("Table 4b. Association of full DBP PRS with renal composite cancer, N= ",nrow(analysis_data)))
+
+```
+
+
+```{r,eval=FALSE}
+
+combine_forestplot(PRS1=Comp_SBP_PRS1,PRS2=Comp_SBP_PRS2,PRS3=Comp_SBP_PRS3,which_outcome="Renal composite cancer")
+
+
+combine_forestplot(PRS1=Comp_DBP_PRS1, PRS2=Comp_DBP_PRS2, PRS3=Comp_DBP_PRS3,which_exposure = "DBP",which_PRS = "DBP PRS",which_outcome="Renal composite cancer")
+
+
+```
+
+# Remove 10 PCs
+
+```{r}
+# Remove genetic array and PCs 
+RF <- c('TEU_BaC_AgeAtRec','BaC_Sex','BSM_BMI','TEU_Smo_Status','GeP_Array')
+
+SBP_wo<-MR_outputs(PRS="TEU_SBP_PRS",RF=RF,return="MR",forestplot = TRUE)
+
+pander(SBP_wo$tab, caption = paste0("Association of full SBP PRS with renal composite cancer without adjusting for genetic array and first 10 PCs, N= ",nrow(analysis_data)))
+
+DBP_wo<-MR_outputs(PRS="TEU_DBP_PRS",RF=RF,return="MR",forestplot = TRUE)
+
+pander(DBP_wo$tab, caption = paste0("Association of full DBP PRS with renal composite cancer without adjusting for genetic array and first 10 PCs, N= ",nrow(analysis_data)))
+
+```
+
+# Two-sample MR using each SNP
+
+IVW random effects, weighted median and MR-Egger methods.
+
+## Prep data for PLINK2
+
+We plan to use PLINK2 to conduct logistic regression of each variant with our primary outcome (i.e. Renal parenchyma cancer). So far our analysis data is only used in R and its format is not compatible with PLINK2, hence pre-processing data is required.
+
+Below are the list of data we need to prepare for PLINK2, which will then be uploaded (i.e. `scp`) to BMRC: 
+1. A txt file (no header) listing the IDs of participants in our analysis data. 
+
+```{r ID list,eval=FALSE}
+
+# ID list in analysis pop
+
+write.table(data$ID,file = file.path(config$data$derived,"MRAnalysisPop.txt"),row.names = FALSE,col.names = FALSE)
+
+```
+
+2. A phenotype file (tab-delimited file) with outcome indicator. 
+
+```{r phenotype file,eval=FALSE}
+
+pheno<-data%>%select(ID,TEU_paren_status)%>%
+  rename(IID=ID)
+
+write.table(pheno,file = file.path(config$data$derived,"Pheno.txt"),row.names = FALSE,col.names = TRUE,sep="\t", quote = FALSE)
+
+#write.table(pheno,file = file.path(config$data$derived,"Pheno.tsv"),row.names = FALSE,col.names = TRUE,sep="\t", quote = FALSE)
+
+```
+
+
+3. A covariate file with covariates to be adjusted for (excpet sex because .psam has this info).
+
+```{r covar file,eval=FALSE}
+
+RF <- c('TEU_BaC_AgeAtRec',#'BaC_Sex',
+        'BSM_BMI','TEU_Smo_Status','GeP_Array',paste0('GeP_PC_',1:10))
+
+
+covar<-data%>%select(ID,all_of(RF))%>%
+  rename(IID=ID)
+
+write.table(covar,file = file.path(config$data$derived,"Covar.txt"),row.names = FALSE,col.names = TRUE,sep="\t", quote = FALSE)
+
+```
+
+## Logistic regression in PLINK2
+
+Below documents the bash commands for conducting logistic regression in PLINK2, which will run on BMRC not locally!
+
+```{bash,eval=FALSE}
+
+module load PLINK/2.00a2.3_x86_64
+module load R/default
+
+
+cd /well/hunter/users/ryo297/ukb/MRforRenal
+
+# First create new plink2 binary files using just our analysis pop
+
+plink2 --pfile inputs/raw \
+--memory 15000 \
+--extract inputs/snpQC.snplist \
+--exclude inputs/AfterQC.prune.out \
+--keep-fam inputs/MRAnalysisPop.txt \
+--freq cols=chrom,pos,ref,alt,reffreq,altfreq,nobs \
+--make-pgen psam-cols=sex \
+--out outputs/AnalysisPop 
+
+# 881 variants and 313520 samples
+# Note that necessary to have psam-cols=sex to omit the family ID (FID) because we don't have FID in Pheno.txt and Covar.txt 
+
+```
+
+```{r,eval=FALSE}
+# This code chunk is just for checking 
+
+# Important: Need to make sure the minor allele of AnalysisPop corresponds to the effect allele in beta file 
+
+library(dplyr)
+library(data.table)
+
+# Read in afreq 
+
+freq<-read.table('./outputs/AnalysisPop.afreq')
+colnames(freq)<-c("chrom","pos","ID","ref","alt","reffreq","altfreq","nobs")
+
+freq=freq%>%mutate(minor_allele=ifelse(reffreq<0.5,ref,alt))
+
+# Read in beta
+beta<-read.table('./inputs/DBP_score.txt')
+
+# left join on freq because we only care about the SNPs after QC
+
+result<-left_join(freq,beta,by=c("ID"="V1"))
+
+# Clearly not aligned....
+
+```
+
+
+```{bash logistic,eval=FALSE}
+
+#https://www.cog-genomics.org/plink/2.0/assoc
+
+plink2 --pfile outputs/AnalysisPop \
+--memory 15000 \
+--pheno iid-only inputs/Pheno.txt --1 \
+--covar iid-only inputs/Covar.txt \
+--glm sex no-firth hide-covar cols=chrom,pos,ref,alt,test,nobs,beta,orbeta,se,tz,p,err \
+--out outputs/beta_ZY
+
+# --glm sex no-firth means conduct logisitic regression and always adjust for sex (in .psam not in Covar.txt)
+```
+
+
+## Combine beta_ZX and beta_ZY
+
+```{r}
+# Read in beta_ZY copied from BMRC 
+
+beta_ZY<-read.delim(file.path(config$data$derived,"beta_ZY.TEU_paren_status.glm.logistic"),header = TRUE)
+
+# Only keep the essential columns 
+beta_ZY<-beta_ZY%>%select(ID,A1,BETA,SE,P)
+
+
+beta_ZX<-read.csv('K:\\TEU\\UKB_Genetic_Data\\PRS_Pipeline\\prs\\projects\\htn-evangelou2018\\inputs\\Betas.csv')
+
+beta_ZX<-beta_ZX%>%select(effect_allele,reference_allele,Beta_SBP,se_SBP,P_SBP,Beta_DBP,se_DBP,P_DBP,chr_pos)
+
+# Left join on beta_ZY because it only contains SNPs after QC and LD
+betas<-left_join(beta_ZY,beta_ZX,by=c("ID"="chr_pos"))
+
+# First need to check if it's only just flipping beta scenario, no strand flipping scenario.
+
+betas%>%mutate(ind=case_when(A1==effect_allele ~ 1,
+                             A1==reference_allele ~ 1,
+                             TRUE ~ 0))%>%pull(ind)%>%unique
+
+# Fine just flipping beta scenario
+
+# We would flip beta_ZY if necessary because it's easier to flip 1 beta than 2
+# So the effect allele is "effect_allele" column
+betas<-betas%>%
+  mutate(Beta_Renal=ifelse(A1==effect_allele,BETA,-BETA))%>%
+  select(!c("BETA","A1"))
+
+```
+
+## MR Sensitivity analyses
+
+```{r MR object}
+
+# SBP
+
+betas_SBP<-betas%>%filter(!is.na(Beta_SBP)) # remove SNP with NA beta
+
+MRInputObject_SBP <- mr_input(bx = betas_SBP$Beta_SBP,bxse = betas_SBP$se_SBP,by = betas_SBP$Beta_Renal,byse = betas_SBP$SE)
+
+# DBP
+MRInputObject_DBP <- mr_input(bx = betas$Beta_DBP,bxse = betas$se_DBP,by = betas$Beta_Renal,byse = betas$SE)
+
+```
+
+### Inverse-variance weighted method
+
+We performed random effects analysis (default).
+
+```{r IVW}
+
+IVWObject_SBP<-mr_ivw(MRInputObject_SBP,
+                  model = "default", # random-effects
+                  robust = FALSE,
+                  penalized = FALSE,
+                  correl = FALSE, # SNPs are independent
+                  weights = "simple", #IVW weights
+                  psi = 0, # Two sample MR, no sample overalpping
+                  distribution = "normal",
+                  alpha = 0.05)
+
+IVWObject_DBP<-mr_ivw(MRInputObject_DBP,
+                  model = "default", # random-effects
+                  robust = FALSE,
+                  penalized = FALSE,
+                  correl = FALSE, # SNPs are independent
+                  weights = "simple", #IVW weights
+                  psi = 0, # Two sample MR, no sample overalpping
+                  distribution = "normal",
+                  alpha = 0.05)
+
+```
+
+### MR-Egger
+
+The MR-Egger method is implemented using a random-effects model only; a fixed-effect model does not make sense as pleiotropy leads to heterogeneity between the causal estimates targeted by the genetic variants.
+
+We also performed intercept test for directional pleiotropy.
+
+```{r Egger}
+
+Egger_SBP<-mr_egger(MRInputObject_SBP,
+                    robust = FALSE,
+                    penalized = FALSE,
+                    correl = FALSE,
+                    distribution = "normal",
+                    alpha = 0.05)
+
+Egger_DBP<-mr_egger(MRInputObject_DBP,
+                    robust = FALSE,
+                    penalized = FALSE,
+                    correl = FALSE,
+                    distribution = "normal",
+                    alpha = 0.05)
+
+```
+
+
+
+### Median-based method
+
+We performed both simple and weighted median method.
+
+```{r simple median}
+
+SMedian_SBP<-mr_median(MRInputObject_SBP,
+                       weighting = "simple",
+                       distribution = "normal",
+                       alpha=0.05,
+                       iterations = 10000, #Boostrap method for computing CI, default choice
+                       seed = 314159265) #default choice
+
+SMedian_DBP<-mr_median(MRInputObject_DBP,
+                       weighting = "simple",
+                       distribution = "normal",
+                       alpha=0.05,
+                       iterations = 10000, #Boostrap method for computing CI, default choice
+                       seed = 314159265) #default choice
+
+```
+
+```{r weighted median}
+
+WMedian_SBP<-mr_median(MRInputObject_SBP,
+                       weighting = "weighted",
+                       distribution = "normal",
+                       alpha=0.05,
+                       iterations = 10000, #Boostrap method for computing CI, default choice
+                       seed = 314159265) #default choice
+
+WMedian_DBP<-mr_median(MRInputObject_DBP,
+                       weighting = "weighted",
+                       distribution = "normal",
+                       alpha=0.05,
+                       iterations = 10000, #Boostrap method for computing CI, default choice
+                       seed = 314159265) #default choice
+
+```
+
+### Mode based method
+
+```{r Mode}
+
+# Weighted (Need to revisit)
+WMode_SBP<-mr_mbe(MRInputObject_SBP,
+                  weighting = "weighted",
+                  stderror = "delta",
+                  phi = 1,
+                  seed = 314159265,
+                  iterations = 10000,
+                  distribution = "normal",
+                  alpha = 0.05)
+
+WMode_DBP<-mr_mbe(MRInputObject_DBP,
+                  weighting = "weighted",
+                  stderror = "delta",
+                  phi = 1,
+                  seed = 314159265,
+                  iterations = 10000,
+                  distribution = "normal",
+                  alpha = 0.05)
+
+```
+
+
+Summarise above in one plot/table:
+
+```{r MR SBP}
+
+MRAllObject_SBP <- mr_allmethods(MRInputObject_SBP, method = "main")
+
+# Comparison of estimates from diff methods
+mr_plot(MRAllObject_SBP)
+```
+
+```{r customise SBP MR plot}
+# Customise MR plot
+object<-MRAllObject_SBP;object@Data@exposure="SBP";object@Data@outcome="renal parenchyma cancer"
+df<-MRAllObject_SBP@Values
+# Only keep Weighted median, IVW and MR-Egger
+new.df<-df[2:4,1:2]
+new.df$Intercept<-c(0,0,df[5,2])
+
+
+MRplot_SBP<-ggplot(data = NULL, aes(x = object@Data@betaX, y = object@Data@betaY)) +
+                  geom_point() +
+                  geom_hline(yintercept = 0, color = "red", alpha = 0.2) +
+                  geom_vline(xintercept = 0, color = "red", alpha = 0.2) +
+                  
+                  geom_abline(data = new.df, aes(intercept = Intercept, slope = Estimate, color = Method, linetype = Method), show.legend = TRUE, size = 1) +
+                  
+                  scale_colour_manual(name="Method", labels = new.df$Method, 
+                                      breaks = c("Weighted median", "IVW", "MR-Egger"),
+                                      values = c("#00BFC4","#F8766D","#7CAE00")) +
+                  scale_linetype_manual(name="Method", labels = new.df$Method,
+                                        breaks = c("Weighted median", "IVW","MR-Egger"),
+                                        values = c("solid", "solid","solid")) +
+                  xlab(paste("Genetic association with", object@Data@exposure)) +
+                  ylab(paste("Genetic association with", object@Data@outcome)) +
+                  #ggtitle("Comparison of all methods") +
+                  theme(
+                    plot.title = element_text(size = rel(1.5), face = "bold"),
+                    # Background
+                    panel.background = element_rect(fill = "white"),
+                    panel.grid.major = element_line(colour = "gray80", linetype = "dotted"),
+                    panel.grid.minor = element_line(colour = "gray90", linetype = "dotted"),
+                    legend.key = element_rect(fill = "white")
+                  ) 
+
+```
+
+
+
+```{r MR DBP}
+
+MRAllObject_DBP <- mr_allmethods(MRInputObject_DBP, method = "main")
+
+# Comparison of estimates from diff methods
+mr_plot(MRAllObject_DBP)
+```
+
+```{r customise DBP MR plot}
+# Customise MR plot
+object<-MRAllObject_DBP;object@Data@exposure="DBP";object@Data@outcome="renal parenchyma cancer"
+df<-MRAllObject_DBP@Values
+# Only keep Weighted median, IVW and MR-Egger
+new.df<-df[2:4,1:2]
+new.df$Intercept<-c(0,0,df[5,2])
+
+
+MRplot_DBP<-ggplot(data = NULL, aes(x = object@Data@betaX, y = object@Data@betaY)) +
+                  geom_point() +
+                  geom_hline(yintercept = 0, color = "red", alpha = 0.2) +
+                  geom_vline(xintercept = 0, color = "red", alpha = 0.2) +
+                  
+                  geom_abline(data = new.df, aes(intercept = Intercept, slope = Estimate, color = Method, linetype = Method), show.legend = TRUE, size = 1) +
+                  
+                  scale_colour_manual(name="Method", labels = new.df$Method, 
+                                      breaks = c("Weighted median", "IVW", "MR-Egger"),
+                                      values = c("#00BFC4","#F8766D","#7CAE00")) +
+                  scale_linetype_manual(name="Method", labels = new.df$Method,
+                                        breaks = c("Weighted median", "IVW","MR-Egger"),
+                                        values = c("solid", "solid","solid")) +
+                  xlab(paste("Genetic association with", object@Data@exposure)) +
+                  ylab(paste("Genetic association with", object@Data@outcome)) +
+                  #ggtitle("Comparison of all methods") +
+                  theme(
+                    plot.title = element_text(size = rel(1.5), face = "bold"),
+                    # Background
+                    panel.background = element_rect(fill = "white"),
+                    panel.grid.major = element_line(colour = "gray80", linetype = "dotted"),
+                    panel.grid.minor = element_line(colour = "gray90", linetype = "dotted"),
+                    legend.key = element_rect(fill = "white")
+                  ) 
+
+```
+
+
+Scale the estimate to convey 5mmHg increase in BP and combine estimates of all methods into a forest plot.
+
+```{r post-processing,eval=FALSE}
+# Scale estimate into 5mmHg increase in BP instead of 1
+# And exp() to obtain the OR
+
+df<-MRAllObject_DBP@Values
+colnames(df)[4]<-"L.CI";colnames(df)[5]<-"U.CI"
+
+df<-df%>%
+  # Remove the MR-Egger intercept line because doesn't make sense to include in forest plot
+  filter(Method!="(intercept)")%>%
+  mutate(OR=exp(Estimate*5),
+         OR_LCI=exp(ci_normal("l",Estimate*5,`Std Error`*5,0.05)),
+         OR_UCI=exp(ci_normal("u",Estimate*5,`Std Error`*5,0.05)))
+```
+
+```{r Forestplot}
+# Forest plot
+
+# SBP
+SA_forestplot(MR_outputs_df=MRAllObject_SBP@Values, which_exposure="SBP",which_PRS="SBP PRS",which_outcome="Renal parenchyma cancer", xticks=c(0.9,1,1.1,1.2,1.3,1.4))
+
+# DBP
+SA_forestplot(MR_outputs_df = MRAllObject_DBP@Values,which_exposure = "DBP",which_PRS = "DBP variants",which_outcome = "renal parenchyma cancer",xticks = c(1,1.2,1.4,1.6,1.8))
+
+```
+
+
+### Leave-one-out test
+
+We need to use `TwoSampleMR` R package so need to do some processing to match the format required. 
+
+```{r Add EAF}
+
+# Need to bind the eaf (the freq file we used to remove ambiguous snps)
+freq_ZY<-read.delim(file.path(config$data$derived,"raw.afreq"),header = TRUE)
+
+# Merge with betas
+exp_outcome<-left_join(betas,freq_ZY%>%select(ID,REF,ALT,ALT_FREQS),by="ID")%>%
+  mutate(EAF=case_when(effect_allele==REF~1-ALT_FREQS,
+                       effect_allele==ALT~ALT_FREQS,
+                       TRUE~NA_real_))%>%
+  select(!c("REF","ALT","ALT_FREQS"))
+
+# export outcome because the stupid TSMR can't handle ald read in data..... 
+# Save SBP and DBP separately
+
+data.table::fwrite(exp_outcome,file.path(config$data$derived,"DBP_outcome.txt"),sep = "\t")
+
+SBP_outcome=exp_outcome%>%filter(!is.na(Beta_SBP))
+
+data.table::fwrite(SBP_outcome,file.path(config$data$derived,"SBP_outcome.txt"),sep = "\t")
+
+```
+
+```{r TwoSampleMR format}
+
+# SBP
+outcome_dat <- read_outcome_data(
+    filename = file.path(config$data$derived,"SBP_outcome.txt"),
+    sep = "\t",
+    snp_col = "ID",
+    beta_col = "Beta_Renal",
+    se_col = "SE",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "reference_allele",
+    eaf_col = "EAF",
+    pval_col = "P"
+    )
+
+exposure_dat <- read_exposure_data(
+  filename = file.path(config$data$derived,"SBP_outcome.txt"),
+    sep = "\t",
+    snp_col = "ID",
+    beta_col = "Beta_SBP",
+    se_col = "se_SBP",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "reference_allele",
+    eaf_col = "EAF",
+    pval_col = "P_SBP"
+)
+
+SBP_dat=harmonise_data(exposure_dat = exposure_dat,outcome_dat = outcome_dat,action = 1)
+
+SBP_dat$exposure="SBP";SBP_dat$outcome="Renal parenchyma cancer"
+# Use action=1 so that it doesn't remove any SNPs! 
+# action=2 would remove ambiguous SNPs according to their threshold, which is more strict than ours
+
+# DBP
+outcome_dat <- read_outcome_data(
+    filename = file.path(config$data$derived,"DBP_outcome.txt"),
+    sep = "\t",
+    snp_col = "ID",
+    beta_col = "Beta_Renal",
+    se_col = "SE",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "reference_allele",
+    eaf_col = "EAF",
+    pval_col = "P"
+    )
+
+exposure_dat <- read_exposure_data(
+  filename = file.path(config$data$derived,"DBP_outcome.txt"),
+    sep = "\t",
+    snp_col = "ID",
+    beta_col = "Beta_DBP",
+    se_col = "se_DBP",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "reference_allele",
+    eaf_col = "EAF",
+    pval_col = "P_DBP"
+)
+
+DBP_dat=harmonise_data(exposure_dat = exposure_dat,outcome_dat = outcome_dat,action = 1)
+
+DBP_dat$exposure="DBP";SBP_dat$outcome="Renal parenchyma cancer"
+
+```
+
+
+```{r loo}
+#res <- mr(SBP_dat, method_list=c("mr_ivw"))
+
+# SBP
+LOO_SBP<-mr_leaveoneout(SBP_dat,parameters = default_parameters()) #default is IVW
+
+LOO_SBP_Plot<-mr_leaveoneout_plot(LOO_SBP)
+
+shinyApp(ui = fluidPage(
+  mainPanel(
+    plotOutput("main_plot",height = "5000px",width = "1000px")
+  )),
+  server = function(input, output) {
+    
+    output$main_plot <- renderPlot({
+      
+      mr_leaveoneout_plot(LOO_SBP) }, height = 8000, width = 1000 )
+  })
+
+ggsave(LOO_SBP_Plot[[1]], file="K:\\TEU\\MRforRenal\\Stats_Outputs\\LOO_SBP_Plot.pdf", width=10, height=80,limitsize = FALSE)
+
+
+# DBP
+LOO_DBP<-mr_leaveoneout(DBP_dat,parameters = default_parameters())
+
+LOO_DBP_Plot<-mr_leaveoneout_plot(LOO_DBP)
+
+ggsave(LOO_DBP_Plot[[1]], file="K:\\TEU\\MRforRenal\\Stats_Outputs\\LOO_DBP_Plot.pdf", width=10, height=80,limitsize = FALSE)
+
+```
+
+
+### Steiger directionality test
+
+A statistical test for whether the assumption that exposure causes outcome is valid.
+
+```{steiger}
+# https://mrcieu.github.io/TwoSampleMR/reference/mr_steiger.html
+
+# SBP
+
+r_SBP=get_r_from_pn(p=SBP_dat$pval.exposure,n=1056625)
+r_outcome=get_r_from_lor(lor=SBP_dat$beta.outcome,af=SBP_dat$eaf.outcome,ncase = sum(data$TEU_paren_status),ncontrol = nrow(data)-sum(data$TEU_paren_status),prevalence = 0,model = "logit")
+
+steiger_SBP<-mr_steiger(
+    p_exp = betas$P_SBP, # p-values of SNP-exposure
+    p_out = betas$P, # p-values of SNP-outcome
+    n_exp = 1056625, # sample size for p_exp (copied from Supp Table 24 in Evangelou2018)
+    n_out = nrow(data), 
+    r_xxo = 1, 
+    r_yyo = 1,
+    r_exp=r_SBP,
+    r_out=r_outcome
+)
+
+#SBP_dat$samplesize.outcome=nrow(data)
+#SBP_dat$samplesize.exposure=1056625
+#directionality_test(SBP_dat)
+# Got the results but how????
+
+# DBP
+
+r_DBP=get_r_from_pn(p=DBP_dat$pval.exposure,n=1056625)
+r_outcome=get_r_from_lor(lor=DBP_dat$beta.outcome,af=DBP_dat$eaf.outcome,ncase = sum(data$TEU_paren_status),ncontrol = nrow(data)-sum(data$TEU_paren_status),prevalence = 0,model = "logit")
+
+steiger_DBP<-mr_steiger(
+    p_exp = betas$P_DBP, # p-values of SNP-exposure
+    p_out = betas$P, # p-values of SNP-outcome
+    n_exp = 1056625, # sample size for p_exp (copied from Supp Table 24 in Evangelou2018)
+    n_out = nrow(data), 
+    r_xxo = 1, 
+    r_yyo = 1,
+    r_exp=r_DBP,
+    r_out=r_outcome
+)
+
+```
+
+
